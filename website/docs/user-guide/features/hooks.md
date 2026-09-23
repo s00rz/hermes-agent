@@ -15,7 +15,7 @@ Hermes has four hook systems that run custom code at key lifecycle points:
 | **[Shell hooks](#shell-hooks)** | `hooks:` block in profile `config.yaml` pointing at shell scripts | CLI + Gateway + Desktop/TUI/dashboard chat | Drop-in scripts for blocking, auto-formatting, context injection |
 | **[Outbound webhooks](#outbound-webhooks)** | `hooks.outbound:` list in `~/.hermes/config.yaml` | CLI + Gateway | Push signed lifecycle events to external HTTP endpoints — CI, dashboards, other agents |
 
-Hook callback errors are isolated and logged rather than crashing the agent. Hooks are not all passive: directive/control hooks can change flow, transforms can replace content, and a shell `pre_tool_call` hook can block or fail closed.
+Hook callback errors are isolated and logged rather than crashing the agent. Hooks are not all passive: directive/control hooks can change flow, transforms can replace content, and `pre_tool_call` / `pre_completion` fail closed when their policy callback fails.
 
 ## Gateway Event Hooks
 
@@ -447,6 +447,7 @@ Payload fields below are the exact event-specific fields supplied by each call s
 | `post_llm_call` | Observer | Successful, non-interrupted turn finalization; return ignored. | `session_id`, `task_id`, `turn_id`, `user_message`, `assistant_response`, `conversation_history`, `model`, `platform` | Full prompt, response, and history. |
 | `transform_llm_output` | Transform | Before `post_llm_call` and final delivery; first non-empty string replaces the response. | `response_text`, `session_id`, `model`, `platform` | Full final assistant text. |
 | `pre_verify` | Directive/control | At the bounded edited-code verify gate; first valid continue/block-stop directive keeps the turn going. | `session_id`, `platform`, `model`, `coding`, `attempt`, `final_response`, `changed_paths` | Draft response and changed paths. |
+| `pre_completion` | Directive/control | For every normal final-text candidate; `continue` keeps the same turn going and `fail` returns a failed, incomplete result. | `session_id`, `platform`, `attempt`, `final_response` | Full draft response. |
 | `pre_api_request` | Observer | Per provider attempt, immediately before the request; return ignored. | `task_id`, `turn_id`, `api_request_id`, `session_id`, `user_message`, `conversation_history`, `platform`, `model`, `provider`, `base_url`, `api_mode`, `api_call_count`, `retry_count`, `request_messages`, `message_count`, `tool_count`, `approx_input_tokens`, `request_char_count`, `max_tokens`, `started_at`, `middleware_trace`, `request` | High sensitivity: legacy `user_message`, `conversation_history`, and `request_messages` are intentionally raw; prefer sanitized `request`. |
 | `post_api_request` | Observer | After normalized provider success; return ignored. | `task_id`, `turn_id`, `api_request_id`, `session_id`, `platform`, `model`, `provider`, `base_url`, `api_mode`, `api_call_count`, `api_duration`, `started_at`, `ended_at`, `finish_reason`, `message_count`, `response_model`, `response`, `usage`, `assistant_message`, `assistant_content_chars`, `assistant_tool_call_count` | Sanitized `response` is available, but raw normalized `assistant_message` may contain model/user content; `usage` is accounting data. |
 | `api_request_error` | Observer | On each failed provider attempt; return ignored. | `task_id`, `turn_id`, `api_request_id`, `session_id`, `platform`, `model`, `provider`, `base_url`, `api_mode`, `api_call_count`, `api_duration`, `started_at`, `ended_at`, `status_code`, `retry_count`, `max_retries`, `retryable`, `reason`, `error`, `request` | Error text may contain provider/user data; `request` is intended to be sanitized. |
@@ -865,6 +866,32 @@ def register(ctx):
 ```
 
 For standing guidance that should shape the built-in missing-evidence nudge, use `agent.verify_guidance`. For broader coding posture rules that don't need to *gate* verification, prefer `agent.coding_instructions` in `config.yaml` — it rides the coding brief and costs no extra turn.
+
+---
+
+### `pre_completion`
+
+Fires for each normal final-text candidate, whether or not the agent edited files. Use it when an external workflow needs to validate a real deliverable before Hermes reports the turn complete. It runs before the built-in verify-on-stop and `pre_verify` gates; an allow result falls through to those existing guards.
+
+**Callback signature:**
+
+```python
+def check_completion(session_id: str, platform: str, attempt: int,
+                     final_response: str, **kwargs):
+```
+
+`attempt` starts at `0` and increases only when a `pre_completion` callback asks Hermes to continue. The hook payload intentionally contains no project-specific task or ownership identity; a consumer must resolve its own trusted authority from the session.
+
+**Return value:**
+
+```python
+return None  # not applicable; continue through the other stop gates
+return {"action": "allow"}
+return {"action": "continue", "message": "Finish the required deliverable, then try completion again."}
+return {"action": "fail", "reason": "completion_check_unavailable"}
+```
+
+Continue appends the candidate assistant message and a synthetic user nudge to the same session, then resumes the existing turn loop. Consumers own their durable retry budget. A fail result ends the turn as failed and incomplete; the attempted candidate remains in the transcript, while the result carries the reason. Invalid directives, callback exceptions, and callback timeouts fail closed.
 
 ---
 

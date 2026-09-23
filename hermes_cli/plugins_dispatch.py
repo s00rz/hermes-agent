@@ -45,7 +45,7 @@ _HOOK_TIMEOUT_BOUNDED_HOOKS: Set[str] = {
 }
 
 # Policy hooks: timeout / still-running must fail closed (block the tool).
-_HOOK_TIMEOUT_FAIL_CLOSED_HOOKS: Set[str] = {"pre_tool_call"}
+_HOOK_TIMEOUT_FAIL_CLOSED_HOOKS: Set[str] = {"pre_tool_call", "pre_completion"}
 # Documented parent-thread serialization contract — never run on a timeout worker (hooks.md).
 _HOOK_CALLER_THREAD_HOOKS: Set[str] = {"subagent_stop"}
 # After a timeout, suppress the same callback this long so a hung hook cannot pile up threads.
@@ -153,6 +153,12 @@ def _hook_call_identity(kwargs: Dict[str, Any]) -> Optional[str]:
         value = kwargs.get(field)
         if isinstance(value, str) and value:
             return value
+    # Completion checks have no public turn-id field: keep their bounded callback gate
+    # independent across simultaneous sessions without widening the hook payload.
+    session_id = kwargs.get("session_id")
+    attempt = kwargs.get("attempt")
+    if isinstance(session_id, str) and session_id and isinstance(attempt, int) and not isinstance(attempt, bool):
+        return f"{session_id}:attempt:{attempt}"
     return None
 
 
@@ -208,8 +214,14 @@ class PluginDispatchMixin:
                 if use_timeout:
                     ret = self._run_hook_callback_bounded(hook_name, cb, kwargs, timeout)
                     if ret is _HOOK_SKIPPED:
-                        if fail_closed:  # policy hook: fail closed with a block directive
-                            results.append({"action": "block", "message": _PRE_TOOL_CALL_TIMEOUT_BLOCK_MESSAGE})
+                        if fail_closed:
+                            if hook_name == "pre_completion":
+                                results.append({
+                                    "action": "fail",
+                                    "reason": "pre_completion hook callback timed out or is still running",
+                                })
+                            else:
+                                results.append({"action": "block", "message": _PRE_TOOL_CALL_TIMEOUT_BLOCK_MESSAGE})
                         continue
                 else:
                     ret = self._invoke_hook_callback(cb, kwargs)
@@ -217,6 +229,8 @@ class PluginDispatchMixin:
                     results.append(ret)
             except Exception as exc:
                 self._report_hook_failure(hook_name, cb, kwargs, exc)
+                if hook_name == "pre_completion":
+                    results.append({"action": "fail", "reason": "pre_completion hook callback failed"})
         return results
 
     def _report_hook_failure(

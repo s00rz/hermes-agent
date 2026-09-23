@@ -115,7 +115,10 @@ VALID_HOOKS: Set[str] = {
     # pre_verify: once per turn when the agent edited code and is about to verify/finish. Return
     # {"action": "continue", "message"} (or Claude-Code Stop {"decision": "block", "reason"}) to keep
     # going; anything else finishes. Bounded by agent.max_verify_nudges.
-    "pre_verify", "pre_api_request", "post_api_request", "api_request_error",
+    # pre_completion: every normal final-text candidate, regardless of edits. Return None /
+    # {"action": "allow"}, {"action": "continue", "message": ...}, or
+    # {"action": "fail", "reason": ...}. Failures and invalid directives fail closed.
+    "pre_verify", "pre_completion", "pre_api_request", "post_api_request", "api_request_error",
     # transform_api_error_classification: once per failed API call BEFORE
     # agent/error_classifier.classify_api_error(). Kwargs: provider, model, status_code, error_type,
     # error_code, error_message, error_body, error, approx_tokens, context_length, num_messages.
@@ -200,7 +203,7 @@ VALID_HOOKS: Set[str] = {
 
 # Hooks whose directive the shell-hook response parser has no channel for. VALID_HOOKS doubles as
 # the shell-hook allow-list, so these are refused loudly instead of having output silently ignored.
-SHELL_UNSUPPORTED_HOOKS: Set[str] = {"transform_api_error_classification"}
+SHELL_UNSUPPORTED_HOOKS: Set[str] = {"transform_api_error_classification", "pre_completion"}
 
 _env_enabled = env_var_enabled  # imported by plugins/memory
 _UNSET = object()
@@ -1927,6 +1930,56 @@ def get_pre_verify_continue_message(
         if action in ("continue", "block") and isinstance(message, str) and message.strip():
             return message.strip()
     return None
+
+
+def get_pre_completion_directive(
+    *, session_id: str = "", platform: str = "", attempt: int = 0,
+    final_response: str = "",
+) -> Dict[str, str]:
+    """Resolve the generic ``pre_completion`` gate.
+
+    Callbacks return ``None``/``{"action": "allow"}``,
+    ``{"action": "continue", "message": ...}``, or
+    ``{"action": "fail", "reason": ...}``. Any invalid directive or dispatch
+    failure is fail-closed because callers use this hook to decide whether a turn
+    may be reported as complete.
+    """
+    payload = {
+        "session_id": session_id,
+        "platform": platform,
+        "attempt": attempt,
+        "final_response": final_response,
+    }
+    try:
+        hook_results = invoke_hook("pre_completion", **payload)
+    except Exception:
+        logger.exception("pre_completion hook dispatch failed")
+        return {"action": "fail", "reason": "pre_completion hook dispatch failed"}
+
+    continue_message = None
+    for result in hook_results:
+        if not isinstance(result, dict):
+            return {"action": "fail", "reason": "pre_completion hook returned an invalid directive"}
+        action = result.get("action")
+        if action == "allow":
+            if set(result) != {"action"}:
+                return {"action": "fail", "reason": "pre_completion allow directive was malformed"}
+            continue
+        if action == "continue":
+            message = result.get("message")
+            if not isinstance(message, str) or not message.strip() or set(result) != {"action", "message"}:
+                return {"action": "fail", "reason": "pre_completion continue directive was malformed"}
+            continue_message = continue_message or message.strip()
+            continue
+        if action == "fail":
+            reason = result.get("reason")
+            if not isinstance(reason, str) or not reason.strip() or set(result) != {"action", "reason"}:
+                return {"action": "fail", "reason": "pre_completion fail directive was malformed"}
+            return {"action": "fail", "reason": reason.strip()[:1000]}
+        return {"action": "fail", "reason": "pre_completion hook returned an unknown action"}
+    if continue_message:
+        return {"action": "continue", "message": continue_message}
+    return {"action": "allow"}
 
 
 def get_plugin_error_classification(

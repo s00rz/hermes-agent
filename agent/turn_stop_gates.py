@@ -1,12 +1,12 @@
 """Text-response stop gates for the conversation turn loop.
 
-When the model stops with a text answer, three gates may instead append the answer as an
-interim row plus a synthetic user-role nudge and continue the turn: verify-on-stop (#65919),
-the ``pre_verify`` plugin hook after code edits, and the kanban worker terminal-tool guard.
-Each keeps the candidate answer as a budget-exhaustion fallback
-(``pending_verification_response``) and clears ``final_response`` so the finalizer can tell
-this gate from error exits (#61631). Nothing here imports ``agent.conversation_loop`` at
-module level (cycle).
+When the model stops with a text answer, four gates inspect the candidate: the generic
+``pre_completion`` plugin hook, verify-on-stop (#65919), the ``pre_verify`` plugin hook after
+code edits, and the kanban worker terminal-tool guard. Continuation gates append the answer
+as an interim row plus a synthetic user-role nudge, keep the candidate as a budget-exhaustion
+fallback (``pending_verification_response``), and clear ``final_response`` so the finalizer
+can tell a gated stop from error exits (#61631). ``pre_completion`` may also fail the turn
+closed. Nothing here imports ``agent.conversation_loop`` at module level (cycle).
 """
 
 from __future__ import annotations
@@ -30,6 +30,7 @@ class StopGateVerdict:
     final_response: Any
     pending_verification_response: Any
     pending_verification_response_previewed: Any
+    failure_reason: Optional[str] = None
 
 
 def _verify_on_stop_nudge(agent) -> Optional[str]:
@@ -76,6 +77,22 @@ def _pre_verify_nudge(agent, final_response, attempt: int) -> Optional[str]:
     return None
 
 
+def _pre_completion_directive(agent, final_response, attempt: int) -> Dict[str, str]:
+    """Ask generic plugins whether this normal final-text candidate may complete."""
+    try:
+        from hermes_cli.plugins import get_pre_completion_directive
+
+        return get_pre_completion_directive(
+            session_id=getattr(agent, "session_id", None) or "",
+            platform=getattr(agent, "platform", None) or "",
+            attempt=attempt,
+            final_response=str(final_response or ""),
+        )
+    except Exception:
+        logger.exception("pre_completion hook dispatch failed closed")
+        return {"action": "fail", "reason": "pre_completion hook dispatch failed"}
+
+
 def _kanban_stop_nudge(agent, messages) -> Optional[str]:
     """Workers must end with kanban_complete / kanban_block; a narrated stop is recorded
     as protocol_violation, so nudge once or twice first."""
@@ -106,7 +123,7 @@ def apply_stop_gates(
     conversation_history: Any, pending_verification_response: Any,
     pending_verification_response_previewed: Any,
 ) -> StopGateVerdict:
-    """Run verify-on-stop → pre_verify hook → kanban stop guard, in that order. Nudges
+    """Run generic completion hook → verify-on-stop → pre_verify hook → kanban stop guard. Nudges
     are user-role rows appended only after the assistant answer row, so role alternation
     holds. Hook lookups are imported lazily from their origin modules (tests patch them
     there)."""
@@ -125,6 +142,25 @@ def apply_stop_gates(
                 final_response or ""
             ),
         )
+
+    _completion_attempt = getattr(agent, "_pre_completion_nudges", 0)
+    _completion = _pre_completion_directive(agent, final_response, _completion_attempt)
+    if _completion["action"] == "fail":
+        return StopGateVerdict(
+            continue_turn=False, final_response=final_response,
+            pending_verification_response=pending_verification_response,
+            pending_verification_response_previewed=pending_verification_response_previewed,
+            failure_reason=_completion["reason"],
+        )
+    if _completion["action"] == "continue":
+        agent._pre_completion_nudges = _completion_attempt + 1
+        final_msg["finish_reason"] = "pre_completion_continue"
+        _append_interim_answer(
+            agent, final_msg, messages, conversation_history, "pre_completion interim flush failed"
+        )
+        verdict = _continue(_completion["message"], "_pre_completion_synthetic")
+        logger.debug("pre_completion nudge issued (attempt %d)", agent._pre_completion_nudges)
+        return verdict
 
     _verify_nudge = _verify_on_stop_nudge(agent)
     if _verify_nudge:

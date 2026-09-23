@@ -59,6 +59,7 @@ _EXIT_REASON_FAILURES: Tuple[Tuple[str, str, bool, bool], ...] = (
     ("local_processing_error", "loop_error", False, False),
     ("repeated_outer_errors", "loop_error", True, True),
     ("error_near_max_iterations", "loop_error", True, True),
+    ("pre_completion_rejected", "loop_error", True, True),
     ("context_compression_timeout", "context_overflow", False, True),
     ("context_compression_exhausted", "context_overflow", False, True),
     ("ollama_runtime_context_too_small", "context_overflow", False, True),

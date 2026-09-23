@@ -40,6 +40,7 @@ class FinalResponseVerdict:
     length_continue_retries: Any
     _pending_verification_response: Any
     _pending_verification_response_previewed: Any
+    failed: bool = False
     result: Optional[Dict[str, Any]] = None
 
 
@@ -69,8 +70,11 @@ def finish_text_response(
             length_continue_retries=length_continue_retries,
             _pending_verification_response=_pending_verification_response,
             _pending_verification_response_previewed=_pending_verification_response_previewed,
+            failed=_completion_failed,
             result=result,
         )
+
+    _completion_failed = False
 
     # Reasoning-only clean stop: some reasoning parsers (vLLM nemotron_v3 past ~500K
     # prompt tokens) file the whole answer as reasoning when the model omits the closing
@@ -255,6 +259,19 @@ def finish_text_response(
     )
     _pending_verification_response = _sg.pending_verification_response
     _pending_verification_response_previewed = _sg.pending_verification_response_previewed
+    if _sg.failure_reason:
+        # Keep the rejected model candidate in the transcript, while returning an explicit
+        # failed result. The finalizer maps this reason to completed=False and must not let a
+        # pending candidate become a clean budget fallback.
+        _completion_failed = True
+        _turn_exit_reason = f"pre_completion_rejected: {_sg.failure_reason}"
+        final_response = f"Completion check failed: {_sg.failure_reason}"
+        append_message(messages, final_msg)
+        try:
+            agent._flush_messages_to_session_db(messages, conversation_history)
+        except Exception:
+            logger.warning("failed pre_completion candidate flush; finalize_turn will retry", exc_info=True)
+        return _verdict("break")
     if _sg.continue_turn:
         final_response = None
         return _verdict("continue")
