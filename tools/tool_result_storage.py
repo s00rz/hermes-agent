@@ -15,7 +15,9 @@ import tempfile
 import threading
 import time
 
-from tools.budget_config import DEFAULT_PREVIEW_SIZE_CHARS, BudgetConfig, DEFAULT_BUDGET
+from tools.budget_config import (
+    ALWAYS_INLINE_TOOL_RESULTS, DEFAULT_PREVIEW_SIZE_CHARS, BudgetConfig, DEFAULT_BUDGET,
+)
 
 logger = logging.getLogger(__name__)
 PERSISTED_OUTPUT_TAG = "<persisted-output>"
@@ -296,6 +298,8 @@ def maybe_persist_tool_result(content: str, tool_name: str, tool_use_id: str, en
     """Layer 2: persist an oversized result, return preview + path. ``threshold`` overrides
     ``config.resolve_threshold(tool_name)``; falls back to inline truncation when no write
     location succeeds."""
+    if tool_name in ALWAYS_INLINE_TOOL_RESULTS:
+        return content
     if threshold is None:
         threshold = config.resolve_threshold(tool_name)
     if threshold == float("inf") or len(content) <= threshold:
@@ -341,7 +345,9 @@ def enforce_turn_budget(tool_messages: list[dict], env=None,
     sizes = [len(msg.get("content", "")) for msg in tool_messages]
     total_size = sum(sizes)
     candidates = [(i, size) for i, size in enumerate(sizes)
-                  if PERSISTED_OUTPUT_TAG not in tool_messages[i].get("content", "")]
+                  if PERSISTED_OUTPUT_TAG not in tool_messages[i].get("content", "")
+                  and (tool_messages[i].get("tool_name") or tool_messages[i].get("name"))
+                  not in ALWAYS_INLINE_TOOL_RESULTS]
     if total_size <= config.turn_budget:
         return tool_messages
     for idx, size in sorted(candidates, key=lambda x: x[1], reverse=True):

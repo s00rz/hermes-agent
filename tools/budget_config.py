@@ -6,8 +6,13 @@ from typing import Dict
 
 from agent.model_metadata import CHARS_PER_TOKEN
 
+# Instructional loads must reach the model whole; a preview is not a loaded skill.
+ALWAYS_INLINE_TOOL_RESULTS = frozenset({"skill_view"})
 # Never overridden; read_file=inf prevents infinite persist->read->persist loops.
-PINNED_THRESHOLDS: Dict[str, float] = {"read_file": float("inf")}
+PINNED_THRESHOLDS: Dict[str, float] = {
+    "read_file": float("inf"),
+    **dict.fromkeys(ALWAYS_INLINE_TOOL_RESULTS, float("inf")),
+}
 
 # Single source of truth for the defaults; tool_result_storage.py imports these.
 DEFAULT_RESULT_SIZE_CHARS: int = 100_000
