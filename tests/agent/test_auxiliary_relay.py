@@ -646,3 +646,34 @@ def test_call_llm_stream_unwraps_completed_response(relay_turn, monkeypatch):
     assert result is completed
     assert captured["stream"] is True
     assert captured["stream_options"] == {"include_usage": True}
+
+
+def test_codex_shim_auxiliary_call_is_decoded_as_chat_completions(relay_turn, caplog):
+    """The Codex shim receives chat.completions kwargs; Relay must not decode them as Responses.
+
+    Labelling the body ``codex_responses`` made Relay's typed codec reject it ("OpenAI
+    Responses request is missing input"), failing every Codex MoA advisor in a live session.
+    """
+    _relay, turn = relay_turn
+    seen = []
+    client = object.__new__(auxiliary_client.CodexAuxiliaryClient)
+    client.chat = SimpleNamespace(completions=SimpleNamespace(create=lambda **kw: (
+        seen.append(kw) or SimpleNamespace(choices=[SimpleNamespace(message=SimpleNamespace(content="ok"))])
+    )))
+    turn.lease.host.retain_managed_execution("test.codex_shim")
+    try:
+        @auxiliary_client._relay_auxiliary_call
+        def run(task):
+            auxiliary_client._set_relay_auxiliary_route("openai-codex", "gpt-test", "codex_responses")
+            return auxiliary_client._relay_sync_completion(
+                client, {"model": "gpt-test", "messages": [{"role": "user", "content": "hi"}]},
+                provider="openai-codex", api_mode="codex_responses",
+            )
+
+        with caplog.at_level("WARNING", logger="agent.relay_llm"):
+            run("moa_reference")
+    finally:
+        turn.lease.host.release_managed_execution("test.codex_shim")
+
+    assert seen and seen[0]["messages"] == [{"role": "user", "content": "hi"}]
+    assert "codec baseline failed" not in caplog.text

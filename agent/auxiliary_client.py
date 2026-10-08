@@ -2603,6 +2603,19 @@ def _record_route_info(
         route_info["model"] = model or "default"
 
 
+def _relay_wire_api_mode(client: Any, api_mode: str | None) -> str | None:
+    """The protocol of the body Relay actually sees for this auxiliary call.
+
+    The Codex shim takes chat.completions kwargs and translates them to Responses inside
+    ``create``, so Relay must decode the request as chat_completions; labelling it
+    ``codex_responses`` makes Relay's typed codec reject it ("OpenAI Responses request is
+    missing input"), which failed every Codex MoA advisor inside a live session.
+    """
+    if isinstance(client, (CodexAuxiliaryClient, AsyncCodexAuxiliaryClient)):
+        return "chat_completions"
+    return api_mode
+
+
 def _relay_auxiliary_metadata(
     *, provider: str | None = None, api_mode: str | None = None
 ) -> tuple[str, str, dict[str, Any]] | None:
@@ -2637,7 +2650,7 @@ def _relay_sync_completion(
     task = relay_context.get("task")
     relay_context["stream_provider"] = provider or relay_context.get("provider")
     callback = create or (lambda request: _create_with_progress(client, request, task))
-    route = _relay_auxiliary_metadata(provider=provider, api_mode=api_mode)
+    route = _relay_auxiliary_metadata(provider=provider, api_mode=_relay_wire_api_mode(client, api_mode))
     # Isolate only the provider callback so the owning thread can unwind its lease/DB
     # transaction on hard cancel without touching the shared client.
     if route is None:
@@ -2670,7 +2683,7 @@ async def _relay_async_completion(
     kwargs = prepare_chat_messages(client, kwargs)
     # Async twin of the seam default above (#98466).
     callback = create or (lambda request: _acreate_with_progress(client, request))
-    route = _relay_auxiliary_metadata(provider=provider, api_mode=api_mode)
+    route = _relay_auxiliary_metadata(provider=provider, api_mode=_relay_wire_api_mode(client, api_mode))
     if route is None:
         return await callback(kwargs)
     provider_name, fallback_model, metadata = route
@@ -2700,7 +2713,7 @@ def _relay_sync_stream(
     # The bypass runs inside the provider callback, AFTER Relay has seen (and possibly
     # rewritten) the real conversation; applying it to `kwargs` would hand Relay an empty one.
     create = lambda request: client.chat.completions.create(**bypass_chat_sdk_request_transform(request, client))  # noqa: E731
-    route = _relay_auxiliary_metadata(provider=provider, api_mode=api_mode)
+    route = _relay_auxiliary_metadata(provider=provider, api_mode=_relay_wire_api_mode(client, api_mode))
     if route is None:
         return create(kwargs)
     provider_name, fallback_model, metadata = route
