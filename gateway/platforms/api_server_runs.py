@@ -5,6 +5,7 @@ import hashlib
 import json
 import logging
 import os
+import re
 import threading
 import time
 import uuid
@@ -198,6 +199,25 @@ def terminal_run_status(result: Dict[str, Any]) -> Tuple[str, Dict[str, Any]]:
         # Undelivered steer text rides on every terminal event/status for client replay.
         fields["pending_steer"] = result["pending_steer"]
     return status, fields
+
+
+_FAILURE_REASON_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,95}\Z")
+
+
+def _typed_failure_facts(result: Dict[str, Any]) -> Dict[str, Any]:
+    """Export the final turn's classifier verdict only when it is well typed.
+
+    A missing or malformed ``failure_reason``/``failure_retryable`` stays absent
+    (unknown); nothing is inferred from error text. Callers attach these facts
+    only beside ``terminal_evidence`` for an unfinished turn, so a successful
+    final fallback never carries an earlier attempt's failure."""
+    facts: Dict[str, Any] = {}
+    reason = result.get("failure_reason")
+    if isinstance(reason, str) and _FAILURE_REASON_RE.match(reason):
+        facts["failure_reason"] = reason
+    if type(result.get("failure_retryable")) is bool:
+        facts["failure_retryable"] = result["failure_retryable"]
+    return facts
 
 
 def _run_not_found(_openai_error, run_id: str) -> "web.Response":
@@ -939,7 +959,12 @@ async def _execute_run(self, run: _RunLaunch, *, _api_server) -> None:
         if run_id in self._shutdown_interrupted_run_ids:
             status = "interrupted"
             fields = {"error": "Gateway shutdown interrupted the run."}
-            extra = {}
+            if extra.get("terminal_evidence"):
+                # Shutdown disposition survives, but a subsequently returned
+                # worker can now truthfully certify exit for this incarnation.
+                extra.update(completed=False, interrupted=True)
+            else:
+                extra = {}
         self._set_run_status(run_id, status, **fields, last_event=f"run.{status}", **extra)
         with suppress(Exception):
             # A worker can finish before its Future is wrapped, so awaiting it
@@ -967,6 +992,19 @@ async def _execute_run(self, run: _RunLaunch, *, _api_server) -> None:
         if not isinstance(result, dict):
             result = {}
         status, fields = terminal_run_status(result)
+        # Only this successful await proves the executor returned (including its
+        # cleanup). Stop acknowledgements, end hooks and CancelledError do not.
+        # Construct identity here, never from untrusted agent result fields.
+        fields["terminal_evidence"] = {
+            "schema_version": 1, "source": "run_conversation",
+            "run_id": run_id, "session_id": run.session_id,
+            "status_ref": f"/v1/runs/{run_id}",
+        }
+        fields["execution_owner"] = {
+            "pid": self._run_owner_pid, "started": self._run_owner_started,
+        }
+        if status != "completed":
+            fields.update(_typed_failure_facts(result))
         if status == "cancelled":
             _finish("cancelled", fields)
         elif result.get("failed"):
@@ -1076,7 +1114,17 @@ async def _handle_run_events(self, request: "web.Request", *, _api_server) -> "w
             break
         await asyncio.sleep(0.05)
     else:
-        return _run_not_found(_api_server._openai_error, run_id)
+        # The durable status survives restart; the buffered event sequence does
+        # not. Export an explicitly named snapshot, never fabricated replay.
+        status = self._durable_run_status(request, run_id)
+        if status is None or status.get("status") not in TERMINAL_STATUSES:
+            return _run_not_found(_api_server._openai_error, run_id)
+        response = web.StreamResponse(status=200, headers=self._sse_headers(request))
+        await response.prepare(request)
+        await response.write(_api_server._sse_frame(
+            _run_event(run_id, "run.status", status_snapshot=dict(status))))
+        await response.write(b": stream closed\n\n")
+        return response
     stream = self._run_streams[run_id]
     raw_last_seq = request.headers.get("Last-Event-ID") or request.query.get("last_seq")
     try:
