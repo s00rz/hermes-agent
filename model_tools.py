@@ -30,9 +30,9 @@ _post_tool_call_hook_suppressed: ContextVar[bool] = ContextVar("post_tool_call_h
 
 
 @contextmanager
-def suppress_post_tool_call_hook():
-    """Let an outer executor own the terminal post-tool event."""
-    token = _post_tool_call_hook_suppressed.set(True)
+def suppress_post_tool_call_hook(suppressed: bool = True):
+    """Let an outer executor own the terminal event, or re-enable its authoritative emission."""
+    token = _post_tool_call_hook_suppressed.set(suppressed)
     try:
         yield
     finally:
