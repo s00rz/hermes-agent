@@ -218,6 +218,21 @@ class _NonStreamRequest:
             f"Codex stream produced no substantive model progress for {int(elapsed)}s "
             f"(progress threshold: {int(wd.progress_timeout)}s)")
 
+    def _progress_stall_kill(self, stall_elapsed: float) -> None:
+        """Model progress began, then stopped while the stream stayed open."""
+        agent, wd = self.agent, self.wd
+        h.logger.warning("Codex stream made no substantive model progress for %.0fs after progress began "
+            "(threshold %.0fs, model=%s, context=~%s tokens). Reconnecting.",
+            stall_elapsed, wd.progress_timeout, self._model(), f"{wd.est_tokens:,}")
+        agent._buffer_diagnostic_status(
+            f"⚠️ Codex stream stopped making model progress for {int(stall_elapsed)}s "
+            f"(model: {self._model()}). Reconnecting.")
+        self._abort_request("codex_progress_stall_kill")
+        agent._touch_activity(f"codex stream killed after {int(stall_elapsed)}s without model progress")
+        self._await_worker_after_kill(
+            f"Codex stream made no substantive model progress for {int(stall_elapsed)}s "
+            f"after progress began (progress threshold: {int(wd.progress_timeout)}s)")
+
     def _idle_kill(self, event_stale_elapsed: float) -> None:
         """SSE events stopped after the phase-specific idle arm point.
 
@@ -305,6 +320,13 @@ class _NonStreamRequest:
                     and (not wd.idle_requires_progress or last_progress_ts is not None)
                     and idle_elapsed > wd.idle_timeout):
                 self._idle_kill(idle_elapsed)
+                break
+            # Lifecycle frames keep the idle watchdog satisfied, so a stream that made progress
+            # and then only sends lifecycle frames is bounded by nothing short of the 900-1200s
+            # wall-clock floor. Apply the first-progress budget to every later progress gap too.
+            if (wd.progress_timeout > 0 and last_progress_ts is not None
+                    and now - last_progress_ts > wd.progress_timeout):
+                self._progress_stall_kill(now - last_progress_ts)
                 break
             if elapsed > wd.stale_timeout:
                 self._stale_kill(elapsed)
